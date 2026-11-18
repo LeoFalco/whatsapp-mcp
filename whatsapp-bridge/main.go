@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -30,6 +32,23 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// dateLogger implementa o waLog.Logger com data no log (o waLog.Stdout só mostra a hora).
+type dateLogger struct {
+	module string
+	out    *log.Logger
+}
+
+func (l dateLogger) logf(level, msg string, args ...any) {
+	l.out.Printf("[%s %s] %s", l.module, level, fmt.Sprintf(msg, args...))
+}
+func (l dateLogger) Warnf(msg string, args ...any)  { l.logf("WARN", msg, args...) }
+func (l dateLogger) Errorf(msg string, args ...any) { l.logf("ERROR", msg, args...) }
+func (l dateLogger) Infof(msg string, args ...any)  { l.logf("INFO", msg, args...) }
+func (l dateLogger) Debugf(msg string, args ...any) {} // mesmo nível INFO de antes
+func (l dateLogger) Sub(module string) waLog.Logger {
+	return dateLogger{module: l.module + "/" + module, out: l.out}
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -200,33 +219,66 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// ID de uma mensagem já gravada em messages.db, para responder citando.
+	ReplyTo string `json:"reply_to,omitempty"`
+	// Números ou JIDs a mencionar; o texto precisa trazer "@<número>" para a menção aparecer.
+	Mentions []string `json:"mentions,omitempty"`
+}
+
+// toJID aceita um JID completo ou só o número de telefone.
+func toJID(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{User: recipient, Server: types.DefaultUserServer}, nil
+}
+
+// buildContextInfo monta a citação (replyTo) e as menções de uma mensagem de texto.
+func buildContextInfo(client *whatsmeow.Client, messageStore *MessageStore, replyTo string, mentions []string) (*waProto.ContextInfo, error) {
+	info := &waProto.ContextInfo{}
+	for _, m := range mentions {
+		jid, err := toJID(m)
+		if err != nil {
+			return nil, fmt.Errorf("invalid mention %q: %v", m, err)
+		}
+		info.MentionedJID = append(info.MentionedJID, jid.String())
+	}
+	if replyTo == "" {
+		return info, nil
+	}
+
+	var sender, content string
+	var isFromMe bool
+	err := messageStore.db.QueryRow(
+		"SELECT sender, content, is_from_me FROM messages WHERE id = ? LIMIT 1", replyTo,
+	).Scan(&sender, &content, &isFromMe)
+	if err != nil {
+		return nil, fmt.Errorf("message to reply not found: %s", replyTo)
+	}
+
+	// messages.db guarda só o usuário do remetente; o servidor (@lid ou número) sai do mapa da sessão.
+	participant := types.JID{User: sender, Server: types.DefaultUserServer}
+	if isFromMe {
+		participant = client.Store.ID.ToNonAD()
+	} else if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), types.JID{User: sender, Server: types.HiddenUserServer}); err == nil && !pn.IsEmpty() {
+		participant = types.JID{User: sender, Server: types.HiddenUserServer}
+	}
+
+	info.StanzaID = proto.String(replyTo)
+	info.Participant = proto.String(participant.String())
+	info.QuotedMessage = &waProto.Message{Conversation: proto.String(content)}
+	return info, nil
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
-	// Create JID for recipient
-	var recipientJID types.JID
-	var err error
-
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
-		}
-	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
-		}
+	recipientJID, err := toJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
 	}
 
 	msg := &waProto.Message{}
@@ -357,6 +409,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if replyTo != "" || len(mentions) > 0 {
+		// shortcut: citação e menção só em texto; mídia segue sem ContextInfo até alguém precisar.
+		ctxInfo, err := buildContextInfo(client, messageStore, replyTo, mentions)
+		if err != nil {
+			return false, err.Error()
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{Text: proto.String(message), ContextInfo: ctxInfo}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
@@ -706,7 +765,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo, req.Mentions)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -720,6 +779,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+		})
+	})
+
+	// Estado da conexão, para o MCP e o LaunchAgent saberem se a ponte está de pé e logada.
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{
+			"connected": client.IsConnected(),
+			"logged_in": client.IsLoggedIn(),
 		})
 	})
 
@@ -787,12 +855,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
-	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	// Log com data completa em stdout e em logs/bridge.log, para dar para medir as quedas depois.
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		fmt.Printf("Failed to create logs directory: %v\n", err)
+		return
+	}
+	logFile, err := os.OpenFile("logs/bridge.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Failed to open log file: %v\n", err)
+		return
+	}
+	defer logFile.Close()
+	out := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
+	logger := dateLogger{module: "Client", out: out}
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := dateLogger{module: "Database", out: out}
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -850,6 +929,12 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("Keepalive timeout (errors: %d)", v.ErrorCount)
 		}
 	})
 

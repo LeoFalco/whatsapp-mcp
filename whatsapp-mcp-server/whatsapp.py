@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+SESSION_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -421,9 +422,43 @@ def search_contacts(query: str) -> List[Contact]:
                 jid=contact_data[0]
             )
             result.append(contact)
-            
+
+        # Conversa gravada pelo @lid não tem nome em `chats`: busca também na agenda sincronizada.
+        seen = {c.jid for c in result}
+        for contact in search_address_book(query):
+            if contact.jid not in seen:
+                seen.add(contact.jid)
+                result.append(contact)
+
         return result
-        
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def search_address_book(query: str) -> List[Contact]:
+    """Contatos da agenda que a sessão do WhatsApp sincroniza, com o @lid quando a conversa usa ele."""
+    try:
+        conn = sqlite3.connect(f"file:{SESSION_DB_PATH}?mode=ro", uri=True)
+        pattern = f"%{query}%"
+        rows = conn.execute("""
+            SELECT c.their_jid,
+                   COALESCE(NULLIF(c.full_name, ''), NULLIF(c.push_name, ''), NULLIF(c.business_name, '')),
+                   m.lid
+            FROM whatsmeow_contacts c
+            LEFT JOIN whatsmeow_lid_map m ON m.pn = substr(c.their_jid, 1, instr(c.their_jid, '@') - 1)
+            WHERE c.their_jid LIKE '%@s.whatsapp.net'
+              AND (c.full_name LIKE ? OR c.push_name LIKE ? OR c.business_name LIKE ? OR c.their_jid LIKE ?)
+            LIMIT 50
+        """, (pattern, pattern, pattern, pattern)).fetchall()
+        return [
+            Contact(phone_number=jid.split('@')[0], name=name, jid=f"{lid}@lid" if lid else jid)
+            for jid, name, lid in rows
+        ]
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -622,27 +657,53 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+BRIDGE_DOWN = ("Ponte do WhatsApp fora do ar (localhost:8080). Suba com "
+               "`cd ~/.local/share/whatsapp-mcp/whatsapp-bridge && ./whatsapp-bridge`.")
+
+def bridge_health() -> Tuple[bool, str]:
+    """(ok, motivo): a ponte responde e está conectada ao WhatsApp."""
+    try:
+        status = requests.get(f"{WHATSAPP_API_BASE_URL}/health", timeout=3).json()
+    except requests.RequestException:
+        return False, BRIDGE_DOWN
+    if not status.get("logged_in"):
+        return False, "Ponte no ar, mas a sessão do WhatsApp foi desconectada: precisa ler o QR code de novo."
+    if not status.get("connected"):
+        return False, "Ponte no ar, mas sem conexão com o WhatsApp agora (reconectando)."
+    return True, "ok"
+
+def send_message(recipient: str, message: str, reply_to: Optional[str] = None,
+                 mentions: Optional[List[str]] = None) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
+        ok, reason = bridge_health()
+        if not ok:
+            return False, reason
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        if reply_to:
+            payload["reply_to"] = reply_to
+        if mentions:
+            payload["mentions"] = mentions
+
         response = requests.post(url, json=payload)
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.ConnectionError:
+        return False, BRIDGE_DOWN
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
