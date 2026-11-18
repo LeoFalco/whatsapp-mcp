@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -109,8 +112,30 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Momento em que o dono leu o chat em outro aparelho. Na primeira subida com a coluna, o histórico
+	// já existente conta como lido; nas seguintes o ALTER falha com "duplicate column" e nada muda.
+	if _, err := db.Exec("ALTER TABLE chats ADD COLUMN last_read TIMESTAMP"); err == nil {
+		db.Exec("UPDATE chats SET last_read = ?", time.Now())
+	}
+
 	return &MessageStore{db: db}, nil
 }
+
+// MarkChatRead avança o last_read do chat, sem nunca voltar no tempo.
+func (store *MessageStore) MarkChatRead(chatJID string, readAt time.Time) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET last_read = ? WHERE jid = ? AND (last_read IS NULL OR last_read < ?)",
+		readAt.Local(), chatJID, readAt.Local(),
+	)
+	return err
+}
+
+// unreadSince é o mesmo critério do list_unread_chats do MCP: recebidas depois da última leitura
+// ou da última mensagem enviada pelo dono no chat, o que for mais recente.
+const unreadSince = `COALESCE(MAX(
+	COALESCE((SELECT last_read FROM chats WHERE jid = m.chat_jid), ''),
+	COALESCE((SELECT MAX(timestamp) FROM messages WHERE chat_jid = m.chat_jid AND is_from_me = 1), '')
+), '')`
 
 // Close the database connection
 func (store *MessageStore) Close() error {
@@ -120,7 +145,9 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		// Upsert, não INSERT OR REPLACE: o REPLACE recria a linha e zeraria o last_read a cada mensagem.
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -233,6 +260,54 @@ func toJID(recipient string) (types.JID, error) {
 	return types.JID{User: recipient, Server: types.DefaultUserServer}, nil
 }
 
+// writeResult responde no mesmo formato do /api/send.
+func writeResult(w http.ResponseWriter, success bool, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+}
+
+// senderJID devolve o JID completo de um remetente de messages.db, que guarda só o usuário:
+// o servidor (@lid ou número) sai do mapa da sessão.
+func senderJID(client *whatsmeow.Client, sender string, isFromMe bool) types.JID {
+	if isFromMe {
+		return client.Store.ID.ToNonAD()
+	}
+	lid := types.JID{User: sender, Server: types.HiddenUserServer}
+	if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), lid); err == nil && !pn.IsEmpty() {
+		return lid
+	}
+	return types.JID{User: sender, Server: types.DefaultUserServer}
+}
+
+// requireToken recusa a chamada sem o token de store/api_token: sem ele, qualquer processo
+// local (ou página web, por DNS rebinding) mandaria mensagem em nome do dono.
+func requireToken(token string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// loadAPIToken lê store/api_token ou cria um novo, legível só pelo dono.
+func loadAPIToken() (string, error) {
+	const path = "store/api_token"
+	if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+		return strings.TrimSpace(string(b)), nil
+	}
+	buf := make([]byte, 32)
+	if _, err := crand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+	return token, os.WriteFile(path, []byte(token), 0600)
+}
+
 // buildContextInfo monta a citação (replyTo) e as menções de uma mensagem de texto.
 func buildContextInfo(client *whatsmeow.Client, messageStore *MessageStore, replyTo string, mentions []string) (*waProto.ContextInfo, error) {
 	info := &waProto.ContextInfo{}
@@ -256,13 +331,7 @@ func buildContextInfo(client *whatsmeow.Client, messageStore *MessageStore, repl
 		return nil, fmt.Errorf("message to reply not found: %s", replyTo)
 	}
 
-	// messages.db guarda só o usuário do remetente; o servidor (@lid ou número) sai do mapa da sessão.
-	participant := types.JID{User: sender, Server: types.DefaultUserServer}
-	if isFromMe {
-		participant = client.Store.ID.ToNonAD()
-	} else if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), types.JID{User: sender, Server: types.HiddenUserServer}); err == nil && !pn.IsEmpty() {
-		participant = types.JID{User: sender, Server: types.HiddenUserServer}
-	}
+	participant := senderJID(client, sender, isFromMe)
 
 	info.StanzaID = proto.String(replyTo)
 	info.Participant = proto.String(participant.String())
@@ -782,6 +851,92 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Reage a uma mensagem gravada em messages.db; emoji vazio tira a reação.
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil || req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "POST with chat_jid and message_id is required", http.StatusBadRequest)
+			return
+		}
+		var sender string
+		var isFromMe bool
+		if err := messageStore.db.QueryRow(
+			"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?", req.MessageID, req.ChatJID,
+		).Scan(&sender, &isFromMe); err != nil {
+			writeResult(w, false, fmt.Sprintf("message not found: %s", req.MessageID))
+			return
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err == nil && chat.User == "" {
+			err = fmt.Errorf("missing user")
+		}
+		if err != nil {
+			writeResult(w, false, fmt.Sprintf("invalid chat_jid: %v", err))
+			return
+		}
+		msg := client.BuildReaction(chat, senderJID(client, sender, isFromMe), req.MessageID, req.Emoji)
+		if _, err := client.SendMessage(context.Background(), chat, msg); err != nil {
+			writeResult(w, false, fmt.Sprintf("error sending reaction: %v", err))
+			return
+		}
+		writeResult(w, true, "reaction sent")
+	})
+
+	// Marca como lidas as mensagens recebidas ainda não lidas do chat (os outros veem o tique azul).
+	http.HandleFunc("/api/mark_read", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil || req.ChatJID == "" {
+			http.Error(w, "POST with chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err == nil && chat.User == "" {
+			err = fmt.Errorf("missing user")
+		}
+		if err != nil {
+			writeResult(w, false, fmt.Sprintf("invalid chat_jid: %v", err))
+			return
+		}
+		rows, err := messageStore.db.Query(
+			"SELECT m.id, m.sender FROM messages m WHERE m.chat_jid = ? AND m.is_from_me = 0 AND m.timestamp > "+unreadSince,
+			req.ChatJID,
+		)
+		if err != nil {
+			writeResult(w, false, fmt.Sprintf("database error: %v", err))
+			return
+		}
+		porRemetente := map[string][]types.MessageID{}
+		for rows.Next() {
+			var id, sender string
+			if rows.Scan(&id, &sender) == nil {
+				porRemetente[sender] = append(porRemetente[sender], id)
+			}
+		}
+		rows.Close()
+
+		total := 0
+		for sender, ids := range porRemetente {
+			// Em grupo o recibo precisa do remetente; em conversa direta vai vazio.
+			remetente := types.EmptyJID
+			if chat.Server == types.GroupServer {
+				remetente = senderJID(client, sender, false)
+			}
+			if err := client.MarkRead(context.Background(), ids, time.Now(), chat, remetente); err != nil {
+				writeResult(w, false, fmt.Sprintf("error marking as read: %v", err))
+				return
+			}
+			total += len(ids)
+		}
+		messageStore.MarkChatRead(req.ChatJID, time.Now())
+		writeResult(w, true, fmt.Sprintf("%d message(s) marked as read", total))
+	})
+
 	// Estado da conexão, para o MCP e o LaunchAgent saberem se a ponte está de pé e logada.
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -842,13 +997,28 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Tudo exige o token, menos o health (que não expõe nem envia nada).
+	token, err := loadAPIToken()
+	if err != nil {
+		fmt.Printf("Failed to load API token: %v\n", err)
+		return
+	}
+	protegido := requireToken(token, http.DefaultServeMux.ServeHTTP)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" {
+			http.DefaultServeMux.ServeHTTP(w, r)
+			return
+		}
+		protegido(w, r)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -935,6 +1105,14 @@ func main() {
 
 		case *events.KeepAliveTimeout:
 			logger.Warnf("Keepalive timeout (errors: %d)", v.ErrorCount)
+
+		case *events.Receipt:
+			// Recibo de leitura do próprio dono = ele leu o chat no celular ou em outro aparelho.
+			if v.IsFromMe && (v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf) {
+				if err := messageStore.MarkChatRead(v.Chat.String(), v.Timestamp); err != nil {
+					logger.Warnf("Failed to store read receipt: %v", err)
+				}
+			}
 		}
 	})
 

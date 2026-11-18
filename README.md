@@ -11,6 +11,10 @@
 > - `/api/health` endpoint; the MCP checks it before sending and explains when the bridge is down
 > - `send_message` can reply quoting a message (`reply_to`) and mention people (`mentions`)
 > - Bridge log with full timestamps in `whatsapp-bridge/logs/bridge.log`, including disconnects
+> - `list_unread_chats` and `mark_chat_read`: unread tracking from the owner's read receipts on the phone
+> - `send_reaction`: react to a message (empty emoji removes it)
+> - The bridge REST API requires a token (`whatsapp-bridge/store/api_token`, created on first start); only `/api/health` is open
+> - Read-only mode: set `WHATSAPP_MCP_READ_ONLY=1` in the MCP server environment to block sending, reactions and read marks
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 

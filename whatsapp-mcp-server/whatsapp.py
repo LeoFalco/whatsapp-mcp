@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 import os.path
 import requests
 import json
@@ -660,6 +660,94 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
 BRIDGE_DOWN = ("Ponte do WhatsApp fora do ar (localhost:8080). Suba com "
                "`cd ~/.local/share/whatsapp-mcp/whatsapp-bridge && ./whatsapp-bridge`.")
 
+TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'api_token')
+
+# Modo só leitura: com WHATSAPP_MCP_READ_ONLY=1 no ambiente do MCP, nada é enviado nem marcado como lido.
+# Protege contra uma mensagem recebida induzir o agente a mandar algo.
+READ_ONLY = os.environ.get("WHATSAPP_MCP_READ_ONLY") == "1"
+READ_ONLY_MSG = "MCP do WhatsApp em modo só leitura (WHATSAPP_MCP_READ_ONLY=1): nada foi enviado."
+
+def auth_headers() -> Dict[str, str]:
+    """Token que a ponte cria em store/api_token na primeira subida."""
+    try:
+        with open(TOKEN_PATH) as f:
+            return {"Authorization": f"Bearer {f.read().strip()}"}
+    except OSError:
+        return {}
+
+def bridge_post(path: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    """POST na ponte já com o token, respondendo (sucesso, mensagem) como o send_message."""
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/{path}", json=payload, headers=auth_headers(), timeout=30)
+        if response.headers.get("Content-Type", "").startswith("application/json"):
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text.strip()}"
+    except requests.ConnectionError:
+        return False, BRIDGE_DOWN
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+
+def contact_name(jid: str) -> Optional[str]:
+    """Nome na agenda sincronizada para um JID de pessoa, resolvendo o @lid pelo número."""
+    user, _, server = jid.partition('@')
+    if server not in ('lid', 's.whatsapp.net'):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{SESSION_DB_PATH}?mode=ro", uri=True)
+        if server == 'lid':
+            row = conn.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
+            if not row:
+                return None
+            user = row[0]
+        row = conn.execute("""
+            SELECT COALESCE(NULLIF(full_name, ''), NULLIF(push_name, ''), NULLIF(business_name, ''))
+            FROM whatsmeow_contacts WHERE their_jid = ?
+        """, (f"{user}@s.whatsapp.net",)).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def list_unread_chats(limit: int = 20) -> List[Dict[str, Any]]:
+    """Chats com mensagens recebidas depois da última leitura do dono (recibo de leitura do celular)
+    ou da última mensagem que ele mandou no chat, o que for mais recente."""
+    # O histórico anterior à instalação já nasce lido: a ponte preenche last_read ao criar a coluna.
+    try:
+        conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True)
+        rows = conn.execute("""
+            SELECT m.chat_jid, c.name, COUNT(*) AS unread, MAX(m.timestamp) AS last
+            FROM messages m JOIN chats c ON c.jid = m.chat_jid
+            WHERE m.is_from_me = 0
+              AND m.timestamp > COALESCE(MAX(
+                    COALESCE(c.last_read, ''),
+                    COALESCE((SELECT MAX(timestamp) FROM messages WHERE chat_jid = m.chat_jid AND is_from_me = 1), '')
+                  ), '')
+            GROUP BY m.chat_jid
+            ORDER BY last DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [{"jid": jid, "name": contact_name(jid) or name, "unread_count": n, "last_message_time": last}
+                for jid, name, n, last in rows]
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def mark_chat_read(chat_jid: str) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MSG
+    return bridge_post("mark_read", {"chat_jid": chat_jid})
+
+def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MSG
+    return bridge_post("react", {"chat_jid": chat_jid, "message_id": message_id, "emoji": emoji})
+
 def bridge_health() -> Tuple[bool, str]:
     """(ok, motivo): a ponte responde e está conectada ao WhatsApp."""
     try:
@@ -678,6 +766,8 @@ def send_message(recipient: str, message: str, reply_to: Optional[str] = None,
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
+        if READ_ONLY:
+            return False, READ_ONLY_MSG
 
         ok, reason = bridge_health()
         if not ok:
@@ -693,7 +783,7 @@ def send_message(recipient: str, message: str, reply_to: Optional[str] = None,
         if mentions:
             payload["mentions"] = mentions
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=auth_headers())
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -716,6 +806,8 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
+        if READ_ONLY:
+            return False, READ_ONLY_MSG
         
         if not media_path:
             return False, "Media path must be provided"
@@ -729,7 +821,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -750,6 +842,8 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
+        if READ_ONLY:
+            return False, READ_ONLY_MSG
         
         if not media_path:
             return False, "Media path must be provided"
@@ -769,7 +863,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -802,7 +896,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=auth_headers())
         
         if response.status_code == 200:
             result = response.json()

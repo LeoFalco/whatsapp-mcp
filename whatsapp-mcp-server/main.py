@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_unread_chats as whatsapp_list_unread_chats,
+    mark_chat_read as whatsapp_mark_chat_read,
+    send_reaction as whatsapp_send_reaction
 )
 
 # Initialize FastMCP server
@@ -249,6 +252,40 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def list_unread_chats(limit: int = 20) -> List[Dict[str, Any]]:
+    """List chats with unread incoming messages, most recent first.
+
+    A chat counts as read up to the owner's last read receipt (reading on the phone)
+    or the owner's last sent message in it, whichever is later.
+
+    Args:
+        limit: Maximum number of chats to return (default 20)
+    """
+    return whatsapp_list_unread_chats(limit)
+
+@mcp.tool()
+def mark_chat_read(chat_jid: str) -> Dict[str, Any]:
+    """Mark the unread incoming messages of a chat as read. Senders will see the blue ticks.
+
+    Args:
+        chat_jid: The JID of the chat (from list_unread_chats or list_chats)
+    """
+    success, status_message = whatsapp_mark_chat_read(chat_jid)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Dict[str, Any]:
+    """React to a message with an emoji. An empty emoji removes the reaction.
+
+    Args:
+        chat_jid: The JID of the chat the message is in
+        message_id: The message ID (from list_messages)
+        emoji: A single emoji, e.g. "👍", or "" to remove
+    """
+    success, status_message = whatsapp_send_reaction(chat_jid, message_id, emoji)
+    return {"success": success, "message": status_message}
 
 if __name__ == "__main__":
     # Initialize and run the server
