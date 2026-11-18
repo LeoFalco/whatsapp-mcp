@@ -1,5 +1,17 @@
 # WhatsApp MCP Server
 
+> **This is a maintained fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp)**, created by [Luke Harries](https://github.com/lharries). All credit for the original design and implementation goes to him.
+>
+> The original repository has had no updates since July 2025, with 180+ pull requests and ~100 issues waiting. This fork is actively maintained by [Leonardo Falco](https://github.com/LeoFalco): it keeps the bridge working with current WhatsApp versions and fixes the most reported problems. Issues and pull requests are welcome here.
+>
+> **Changes in this fork:**
+> - Updated [whatsmeow](https://github.com/tulir/whatsmeow), fixing the `Client outdated (405)` connection failure
+> - The REST API listens on `127.0.0.1` only, instead of every network interface
+> - `search_contacts` finds contacts by their address book name, including chats stored by `@lid`
+> - `/api/health` endpoint; the MCP checks it before sending and explains when the bridge is down
+> - `send_message` can reply quoting a message (`reply_to`) and mention people (`mentions`)
+> - Bridge log with full timestamps in `whatsapp-bridge/logs/bridge.log`, including disconnects
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
