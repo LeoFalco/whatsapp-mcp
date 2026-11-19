@@ -896,7 +896,8 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload, headers=auth_headers())
+        # Cobre a primeira tentativa no CDN mais o reenvio pelo celular, que a ponte espera por até 60 s.
+        response = requests.post(url, json=payload, headers=auth_headers(), timeout=180)
         
         if response.status_code == 200:
             result = response.json()
