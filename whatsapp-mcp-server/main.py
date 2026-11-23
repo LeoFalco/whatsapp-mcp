@@ -15,7 +15,8 @@ from whatsapp import (
     download_media as whatsapp_download_media,
     list_unread_chats as whatsapp_list_unread_chats,
     mark_chat_read as whatsapp_mark_chat_read,
-    send_reaction as whatsapp_send_reaction
+    send_reaction as whatsapp_send_reaction,
+    add_group_participants as whatsapp_add_group_participants
 )
 
 # Initialize FastMCP server
@@ -285,6 +286,17 @@ def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Dict[str, Any]:
         emoji: A single emoji, e.g. "👍", or "" to remove
     """
     success, status_message = whatsapp_send_reaction(chat_jid, message_id, emoji)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def add_group_participants(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Add people to a WhatsApp group. Requires being an admin of the group.
+
+    Args:
+        group_jid: The group JID (ends with @g.us, from list_chats)
+        participants: Phone numbers with country code (no + or symbols) or contact JIDs
+    """
+    success, status_message = whatsapp_add_group_participants(group_jid, participants)
     return {"success": success, "message": status_message}
 
 if __name__ == "__main__":
