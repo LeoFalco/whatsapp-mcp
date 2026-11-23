@@ -1010,6 +1010,52 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		writeResult(w, true, fmt.Sprintf("%d message(s) marked as read", total))
 	})
 
+	// Adiciona pessoas a um grupo; só funciona se o dono da sessão for admin do grupo.
+	http.HandleFunc("/api/group_add", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			GroupJID     string   `json:"group_jid"`
+			Participants []string `json:"participants"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil || req.GroupJID == "" || len(req.Participants) == 0 {
+			http.Error(w, "POST with group_jid and participants is required", http.StatusBadRequest)
+			return
+		}
+		group, err := types.ParseJID(req.GroupJID)
+		if err == nil && group.Server != types.GroupServer {
+			err = fmt.Errorf("not a group JID")
+		}
+		if err != nil {
+			writeResult(w, false, fmt.Sprintf("invalid group_jid: %v", err))
+			return
+		}
+		jids := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			jid, err := toJID(p)
+			if err != nil {
+				writeResult(w, false, fmt.Sprintf("invalid participant %s: %v", p, err))
+				return
+			}
+			jids = append(jids, jid)
+		}
+		result, err := client.UpdateGroupParticipants(context.Background(), group, jids, whatsmeow.ParticipantChangeAdd)
+		if err != nil {
+			writeResult(w, false, fmt.Sprintf("error adding participants: %v", err))
+			return
+		}
+		// Error != 0 por participante: 403 = privacidade não deixa adicionar (precisa de convite), 409 = já está no grupo.
+		var falhas []string
+		for _, p := range result {
+			if p.Error != 0 {
+				falhas = append(falhas, fmt.Sprintf("%s (erro %d)", p.JID, p.Error))
+			}
+		}
+		if len(falhas) > 0 {
+			writeResult(w, false, "not added: "+strings.Join(falhas, ", "))
+			return
+		}
+		writeResult(w, true, fmt.Sprintf("%d participant(s) added", len(result)))
+	})
+
 	// Estado da conexão, para o MCP e o LaunchAgent saberem se a ponte está de pé e logada.
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

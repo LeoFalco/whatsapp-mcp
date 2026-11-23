@@ -748,6 +748,11 @@ def send_reaction(chat_jid: str, message_id: str, emoji: str) -> Tuple[bool, str
         return False, READ_ONLY_MSG
     return bridge_post("react", {"chat_jid": chat_jid, "message_id": message_id, "emoji": emoji})
 
+def add_group_participants(group_jid: str, participants: List[str]) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MSG
+    return bridge_post("group_add", {"group_jid": group_jid, "participants": participants})
+
 def bridge_health() -> Tuple[bool, str]:
     """(ok, motivo): a ponte responde e está conectada ao WhatsApp."""
     try:
